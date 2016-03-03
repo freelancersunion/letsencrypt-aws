@@ -43,6 +43,78 @@ class Logger(object):
             formatted_data
         ))
 
+class ElbResource(object):
+    """docstring for ElbResource"""
+    def __init__(self, domain, logger, session):
+        super(ElbResource, self).__init__()
+        self.logger = logger
+        self.hosts = domain["hosts"]
+        self.key_type = domain.get("key_type", "rsa")
+
+        #ELB-specific
+        self.name = domain["elb"]["name"]
+        self.port = domain["elb"].get("port", 443)
+        self.iam_client = session.client("iam")
+        self.elb_client = session.client("elb")
+
+    def add_certificate(self, private_key, pem_certificate, pem_certificate_chain):
+        self.logger.emit("updating-elb.upload-iam-certificate", elb_name=self.name)
+        response = self.iam_client.upload_server_certificate(
+            ServerCertificateName=generate_certificate_name(
+                self.hosts,
+                x509.load_pem_x509_certificate(pem_certificate, default_backend())
+            ),
+            PrivateKey=private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            CertificateBody=pem_certificate,
+            CertificateChain=pem_certificate_chain,
+        )
+        new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
+
+        # Sleep before trying to set the certificate, it appears to sometimes fail
+        # without this.
+        time.sleep(15)
+        self.logger.emit("updating-elb.set-elb-certificate", elb_name=self.name)
+        self.elb_client.set_load_balancer_listener_ssl_certificate(
+            LoadBalancerName=self.name,
+            SSLCertificateId=new_cert_arn,
+            LoadBalancerPort=self.port,
+        )
+
+    def _get_expiration_date_for_certificate(self, ssl_certificate_arn):
+        paginator = \
+            self.iam_client.get_paginator("list_server_certificates").paginate()
+        for page in paginator:
+            for server_certificate in page["ServerCertificateMetadataList"]:
+                if server_certificate["Arn"] == ssl_certificate_arn:
+                    return server_certificate["Expiration"]
+
+    def get_certificate_expiration(self):
+
+        self.logger.emit("updating-elb", elb_name=self.name)
+        response = self.elb_client.describe_load_balancers(
+            LoadBalancerNames=[self.name]
+        )
+        [description] = response["LoadBalancerDescriptions"]
+        [certificate_id] = [
+            listener["Listener"]["SSLCertificateId"]
+            for listener in description["ListenerDescriptions"]
+            if listener["Listener"]["LoadBalancerPort"] == self.port
+        ]
+
+        expiration_date = self._get_expiration_date_for_certificate(
+            certificate_id
+        ).date()
+
+        self.logger.emit(
+            "updating-elb.certificate-expiration",
+            elb_name=self.name, expiration_date=expiration_date
+        )
+        return expiration_date
+
 
 def generate_rsa_private_key():
     return rsa.generate_private_key(
@@ -74,9 +146,9 @@ def generate_csr(private_key, hosts):
 def find_dns_challenge(authz):
     for combo in authz.body.resolved_combinations:
         if (
-            len(combo) == 1 and
-            isinstance(combo[0].chall, acme.challenges.DNS01)
-        ):
+                len(combo) == 1 and
+                isinstance(combo[0].chall, acme.challenges.DNS01)
+            ):
             yield combo[0]
 
 
@@ -87,9 +159,9 @@ def find_zone_id_for_domain(route53_client, domain):
             # meaning in the following order:
             # ["foo.bar.baz.com", "bar.baz.com", "baz.com", "com"]
             if (
-                domain.endswith(zone["Name"]) or
-                (domain + ".").endswith(zone["Name"])
-            ):
+                    domain.endswith(zone["Name"]) or
+                    (domain + ".").endswith(zone["Name"])
+                ):
                 return zone["Id"]
 
 
@@ -133,27 +205,6 @@ def generate_certificate_name(hosts, cert):
     )[:128]
 
 
-def get_load_balancer_certificate(elb_client, elb_name, elb_port):
-    response = elb_client.describe_load_balancers(
-        LoadBalancerNames=[elb_name]
-    )
-    [description] = response["LoadBalancerDescriptions"]
-    [certificate_id] = [
-        listener["Listener"]["SSLCertificateId"]
-        for listener in description["ListenerDescriptions"]
-        if listener["Listener"]["LoadBalancerPort"] == elb_port
-    ]
-    return certificate_id
-
-
-def get_expiration_date_for_certificate(iam_client, ssl_certificate_arn):
-    paginator = iam_client.get_paginator("list_server_certificates").paginate()
-    for page in paginator:
-        for server_certificate in page["ServerCertificateMetadataList"]:
-            if server_certificate["Arn"] == ssl_certificate_arn:
-                return server_certificate["Expiration"]
-
-
 class AuthorizationRecord(object):
     def __init__(self, host, authz, dns_challenge, route53_change_id,
                  route53_zone_id):
@@ -164,8 +215,7 @@ class AuthorizationRecord(object):
         self.route53_zone_id = route53_zone_id
 
 
-def start_dns_challenge(logger, acme_client, elb_client, route53_client,
-                        elb_name, host):
+def start_dns_challenge(logger, acme_client, route53_client, elb_name, host):
     logger.emit(
         "updating-elb.request-acme-challenge", elb_name=elb_name, host=host
     )
@@ -245,93 +295,50 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def add_certificate_to_elb(logger, elb_client, iam_client, elb_name, elb_port,
-                           hosts, private_key, pem_certificate,
-                           pem_certificate_chain):
-    logger.emit("updating-elb.upload-iam-certificate", elb_name=elb_name)
-    response = iam_client.upload_server_certificate(
-        ServerCertificateName=generate_certificate_name(
-            hosts,
-            x509.load_pem_x509_certificate(pem_certificate, default_backend())
-        ),
-        PrivateKey=private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.NoEncryption(),
-        ),
-        CertificateBody=pem_certificate,
-        CertificateChain=pem_certificate_chain,
-    )
-    new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
+def update_resource(logger, acme_client, resource, route53_client, force_issue):
 
-    # Sleep before trying to set the certificate, it appears to sometimes fail
-    # without this.
-    time.sleep(15)
-    logger.emit("updating-elb.set-elb-certificate", elb_name=elb_name)
-    elb_client.set_load_balancer_listener_ssl_certificate(
-        LoadBalancerName=elb_name,
-        SSLCertificateId=new_cert_arn,
-        LoadBalancerPort=elb_port,
-    )
-
-
-def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
-               force_issue, elb_name, elb_port, hosts, key_type):
-    logger.emit("updating-elb", elb_name=elb_name)
-    certificate_id = get_load_balancer_certificate(
-        elb_client, elb_name, elb_port
-    )
-
-    expiration_date = get_expiration_date_for_certificate(
-        iam_client, certificate_id
-    ).date()
-    logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=elb_name, expiration_date=expiration_date
-    )
+    expiration_date = resource.get_certificate_expiration()
     days_until_expiration = expiration_date - datetime.date.today()
     if (
-        days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
-        not force_issue
-    ):
+            days_until_expiration > CERTIFICATE_EXPIRATION_THRESHOLD and
+            not force_issue
+        ):
         return
 
-    if key_type == "rsa":
+    if resource.key_type == "rsa":
         private_key = generate_rsa_private_key()
-    elif key_type == "ecdsa":
+    elif resource.key_type == "ecdsa":
         private_key = generate_ecdsa_private_key()
     else:
-        raise ValueError("Invalid key_type: {!r}".format(key_type))
-    csr = generate_csr(private_key, hosts)
+        raise ValueError("Invalid key_type: {!r}".format(resource.key_type))
+    csr = generate_csr(private_key, resource.hosts)
 
     authorizations = []
     try:
-        for host in hosts:
+        for host in resource.hosts:
             authz_record = start_dns_challenge(
-                logger, acme_client, elb_client, route53_client, elb_name, host
+                logger, acme_client, route53_client, resource.name, host
             )
             authorizations.append(authz_record)
 
         for authz_record in authorizations:
             complete_dns_challenge(
-                logger, acme_client, route53_client, elb_name, authz_record
+                logger, acme_client, route53_client, resource.name, authz_record
             )
 
         pem_certificate, pem_certificate_chain = request_certificate(
-            logger, acme_client, elb_name, authorizations, csr
+            logger, acme_client, resource.name, authorizations, csr
         )
 
-        add_certificate_to_elb(
-            logger,
-            elb_client, iam_client,
-            elb_name, elb_port, hosts,
+        resource.add_certificate(
             private_key, pem_certificate, pem_certificate_chain
         )
+
     finally:
         for authz_record in authorizations:
             logger.emit(
-                "updating-elb.delete-txt-record",
-                elb_name=elb_name, host=authz_record.host
+                "updating-r53.delete-txt-record",
+                resource_name=resource.name, host=authz_record.host
             )
             dns_challenge = authz_record.dns_challenge
             change_txt_record(
@@ -342,23 +349,23 @@ def update_elb(logger, acme_client, elb_client, route53_client, iam_client,
                 dns_challenge.validation(acme_client.key),
             )
 
-
-def update_elbs(logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains):
+def update_domains(logger, acme_client, route53_client, session, force_issue,
+                   domains):
     for domain in domains:
-        update_elb(
+        if 'elb' in domain:
+            resource = ElbResource(domain, logger, session)
+        elif 's3' in domain:
+            raise NotImplementedError()
+        else:
+            raise ValueError("Each domain must contain an ELB or S3 resource.")
+
+        update_resource(
             logger,
             acme_client,
-            elb_client,
+            resource,
             route53_client,
-            iam_client,
             force_issue,
-            domain["elb"]["name"],
-            domain["elb"].get("port", 443),
-            domain["hosts"],
-            domain.get("key_type", "rsa")
         )
-
 
 def setup_acme_client(s3_client, acme_directory_url, acme_account_key):
     uri = rfc3986.urlparse(acme_account_key)
@@ -387,6 +394,8 @@ def acme_client_for_private_key(acme_directory_url, private_key):
     )
 
 
+
+
 @click.group()
 def cli():
     pass
@@ -411,9 +420,7 @@ def update_certificates(persistent=False, force_issue=False):
 
     session = boto3.Session()
     s3_client = session.client("s3")
-    elb_client = session.client("elb")
     route53_client = session.client("route53")
-    iam_client = session.client("iam")
 
     # Structure: {
     #     "domains": [
@@ -435,18 +442,15 @@ def update_certificates(persistent=False, force_issue=False):
     if persistent:
         logger.emit("running", mode="persistent")
         while True:
-            update_elbs(
-                logger, acme_client, elb_client, route53_client, iam_client,
-                force_issue, domains
-            )
+            update_domains(logger, acme_client, route53_client, session,
+                           force_issue, domains)
             # Sleep before we check again
             logger.emit("sleeping", duration=PERSISTENT_SLEEP_INTERVAL)
             time.sleep(PERSISTENT_SLEEP_INTERVAL)
     else:
         logger.emit("running", mode="single")
-        update_elbs(
-            logger, acme_client, elb_client, route53_client, iam_client,
-            force_issue, domains
+        update_domains(
+            logger, acme_client, route53_client, session, force_issue, domains
         )
 
 
